@@ -8,7 +8,7 @@
 This package implements a Pusher websocket client. It is based on the official [Pusher JavaScript client libary](https://github.com/pusher/pusher-js) as well as [go-pusher](https://github.com/toorop/go-pusher).
 
 ## Installation
-	$ go get github.com/goguardian/pusher-ws-go
+	$ go get github.com/bencurio/pusher-ws-go
 
 ## Features
 
