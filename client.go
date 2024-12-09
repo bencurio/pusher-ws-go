@@ -319,7 +319,7 @@ func (c *Client) Unsubscribe(channelName string) error {
 	defer c.mutex.Unlock()
 
 	ch, ok := c.subscribedChannels[channelName]
-	if !ok {
+	if !ok || ch == nil {
 		return nil
 	}
 
