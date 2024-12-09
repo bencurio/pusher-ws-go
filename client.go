@@ -193,8 +193,12 @@ func (c *Client) heartbeat() {
 			c.activityTimer.Reset(c.activityTimeout)
 
 		case <-c.activityTimer.C:
-			websocket.Message.Send(c.ws, pingPayload)
-			// TODO: implement timeout/reconnect logic
+			err := websocket.Message.Send(c.ws, pingPayload)
+			if err != nil {
+				// TODO: implement timeout/reconnect logic
+				c.Disconnect()
+			}
+			c.activityTimer.Reset(c.activityTimeout) // Reset the timer after sending the ping
 		}
 	}
 }
