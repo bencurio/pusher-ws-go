@@ -83,7 +83,7 @@ type Client struct {
 	subscribedChannels subscribedChannels
 
 	mutex sync.RWMutex
-	done chan struct{}
+	done  chan struct{}
 
 	// used for testing
 	OverrideHost string
@@ -99,12 +99,13 @@ type connectionData struct {
 // JSON data from a Pusher event. See https://pusher.com/docs/pusher_protocol#double-encoding
 func UnmarshalDataString(data json.RawMessage, dest interface{}) error {
 	var dataStr string
-	err := json.Unmarshal(data, &dataStr)
-	if err != nil {
-		return err
+	if err := json.Unmarshal(data, &dataStr); err != nil {
+		return fmt.Errorf("failed to unmarshal data to string: %w", err)
 	}
-
-	return json.Unmarshal([]byte(dataStr), dest)
+	if err := json.Unmarshal([]byte(dataStr), dest); err != nil {
+		return fmt.Errorf("failed to unmarshal data string to destination: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) generateConnURL(appKey string) string {
@@ -392,9 +393,9 @@ func (c *Client) SendEvent(event string, data interface{}, channelName string) e
 func (c *Client) Disconnect() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-	
+
 	close(c.done)
-	c.connected = false	
+	c.connected = false
 
 	return c.ws.Close()
 }
