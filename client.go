@@ -2,7 +2,9 @@ package pusher
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -221,6 +223,11 @@ func (c *Client) listen() {
 				return
 			}
 			c.sendError(err)
+			// If EOF, the connection has been closed
+			if errors.Is(err, io.EOF) {
+				c.Disconnect()
+				return
+			}
 			continue
 		}
 
