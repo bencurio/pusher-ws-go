@@ -83,6 +83,7 @@ type Client struct {
 	subscribedChannels subscribedChannels
 
 	mutex sync.RWMutex
+	done chan struct{}
 
 	// used for testing
 	OverrideHost string
@@ -153,6 +154,7 @@ func (c *Client) Connect(appKey string) error {
 			return err
 		}
 		c.connected = true
+		c.done = make(chan struct{})
 		c.socketID = connData.SocketID
 		c.activityTimeout = time.Duration(connData.ActivityTimeout) * time.Second
 		c.activityTimer = time.NewTimer(c.activityTimeout)
@@ -188,6 +190,8 @@ func (c *Client) resetActivityTimer() {
 func (c *Client) heartbeat() {
 	for c.isConnected() {
 		select {
+		case <-c.done:
+			return
 		case <-c.activityTimerReset:
 			if !c.activityTimer.Stop() {
 				<-c.activityTimer.C
@@ -214,43 +218,48 @@ func (c *Client) sendError(err error) {
 
 func (c *Client) listen() {
 	for c.isConnected() {
-		var event Event
-		err := websocket.JSON.Receive(c.ws, &event)
-		if err != nil {
-			// If the websocket connection was closed, Receive will return an error.
-			// This is expected for an explicit disconnect.
-			if !c.isConnected() {
-				return
-			}
-			c.sendError(err)
-			// If EOF, the connection has been closed
-			if errors.Is(err, io.EOF) {
-				c.Disconnect()
-				return
-			}
-			continue
-		}
-
-		c.resetActivityTimer()
-
-		switch event.Event {
-		case pusherPing:
-			websocket.Message.Send(c.ws, pongPayload)
-		case pusherPong:
-			// TODO: stop pong timeout timer
-		case pusherError:
-			c.sendError(extractEventError(event))
+		select {
+		case <-c.done:
+			return
 		default:
-			c.mutex.RLock()
-			for boundChan := range c.boundEvents[event.Event] {
-				go func(boundChan chan Event, event Event) {
-					boundChan <- event
-				}(boundChan, event)
+			var event Event
+			err := websocket.JSON.Receive(c.ws, &event)
+			if err != nil {
+				// If the websocket connection was closed, Receive will return an error.
+				// This is expected for an explicit disconnect.
+				if !c.isConnected() {
+					return
+				}
+				c.sendError(err)
+				// If EOF, the connection has been closed
+				if errors.Is(err, io.EOF) {
+					c.Disconnect()
+					return
+				}
+				continue
 			}
-			if subChan, ok := c.subscribedChannels[event.Channel]; ok {
-				subChan.handleEvent(event.Event, event.Data)
+
+			c.resetActivityTimer()
+
+			switch event.Event {
+			case pusherPing:
+				websocket.Message.Send(c.ws, pongPayload)
+			case pusherPong:
+				// TODO: stop pong timeout timer
+			case pusherError:
+				c.sendError(extractEventError(event))
+			default:
+				c.mutex.RLock()
+				for boundChan := range c.boundEvents[event.Event] {
+					go func(boundChan chan Event, event Event) {
+						boundChan <- event
+					}(boundChan, event)
+				}
+				if subChan, ok := c.subscribedChannels[event.Channel]; ok {
+					subChan.handleEvent(event.Event, event.Data)
+				}
+				c.mutex.RUnlock()
 			}
-			c.mutex.RUnlock()
 		}
 	}
 }
@@ -383,8 +392,9 @@ func (c *Client) SendEvent(event string, data interface{}, channelName string) e
 func (c *Client) Disconnect() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-
-	c.connected = false
+	
+	close(c.done)
+	c.connected = false	
 
 	return c.ws.Close()
 }
