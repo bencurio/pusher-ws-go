@@ -327,3 +327,7 @@ func (pc *presenceChannel) MemberCount() int {
 
 	return len(pc.members)
 }
+
+func (pc *presenceChannel) ResetSubscriptionState() {
+	pc.channel.ResetSubscriptionState()
+}

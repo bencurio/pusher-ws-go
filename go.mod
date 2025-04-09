@@ -1,5 +1,5 @@
 module github.com/bencurio/pusher-ws-go
 
-go 1.17
+go 1.24.1
 
-require golang.org/x/net v0.0.0-20220531201128-c960675eff93
+require golang.org/x/net v0.39.0

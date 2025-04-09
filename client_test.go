@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -747,15 +749,15 @@ func TestClientGenerateConnURL(t *testing.T) {
 
 	t.Run("override", func(t *testing.T) {
 		client := &Client{
-			overrideHost: "foo.bar",
-			overridePort: 1234,
+			OverrideHost: "foo.bar",
+			OverridePort: 1234,
 		}
 
 		gotURL := client.generateConnURL("")
-		if !strings.Contains(gotURL, client.overrideHost) {
+		if !strings.Contains(gotURL, client.OverrideHost) {
 			t.Errorf("Expected connection URL to have override host, got %q", gotURL)
 		}
-		if !strings.Contains(gotURL, fmt.Sprint(client.overridePort)) {
+		if !strings.Contains(gotURL, fmt.Sprint(client.OverridePort)) {
 			t.Errorf("Expected connection URL to have override port, got %q", gotURL)
 		}
 	})
@@ -789,8 +791,8 @@ func TestClientConnect(t *testing.T) {
 
 		client := &Client{
 			Insecure:     true,
-			overrideHost: host,
-			overridePort: portNum,
+			OverrideHost: host,
+			OverridePort: portNum,
 		}
 		defer client.Disconnect()
 
@@ -831,8 +833,8 @@ func TestClientConnect(t *testing.T) {
 
 		client := &Client{
 			Insecure:     true,
-			overrideHost: host,
-			overridePort: portNum,
+			OverrideHost: host,
+			OverridePort: portNum,
 		}
 		defer client.Disconnect()
 
@@ -868,4 +870,323 @@ func TestClientConnect(t *testing.T) {
 			t.Errorf("Expected client subscribed channels to be non-nil")
 		}
 	})
+}
+
+func TestReconnection(t *testing.T) {
+	t.Run("automaticReconnectOnConnectionLoss", func(t *testing.T) {
+		// Setup first server that will intentionally close connection
+		connectionCount := 0
+		var initialServer *httptest.Server
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		initialServer = httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+			connectionCount++
+
+			// Send connection established event
+			connData, _ := json.Marshal(connectionData{
+				SocketID:        fmt.Sprintf("socket-%d", connectionCount),
+				ActivityTimeout: 1,
+			})
+			connDataStr, _ := json.Marshal(string(connData))
+			websocket.JSON.Send(ws, Event{Event: pusherConnEstablished, Data: connDataStr})
+
+			// For the first connection, close it immediately after establishing
+			if connectionCount == 1 {
+				// Wait a moment to ensure client processes connection established
+				time.Sleep(100 * time.Millisecond)
+				ws.Close()
+				wg.Done()
+			} else {
+				// Keep second connection open
+				select {}
+			}
+		}))
+		defer initialServer.Close()
+
+		// Create client with error channel to verify reconnection
+		errorChan := make(chan error, 10)
+		host, port, _ := getServerHostPort(initialServer)
+
+		client := &Client{
+			Insecure:     true,
+			OverrideHost: host,
+			OverridePort: port,
+			Errors:       errorChan,
+			// Override reconnect delay for faster test execution
+			ReconnectDelay: 100 * time.Millisecond,
+		}
+		defer client.Disconnect()
+
+		// Connect to server
+		err := client.Connect("test-app-key")
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+
+		// Wait for first connection to be closed
+		wg.Wait()
+
+		// Wait for reconnection to happen (should be quick with reduced delay)
+		reconnectDetected := false
+		timeout := time.After(5 * time.Second)
+
+		for !reconnectDetected {
+			select {
+			case err := <-errorChan:
+				// Look for reconnection success message
+				if strings.Contains(err.Error(), "reconnection successful") {
+					reconnectDetected = true
+				}
+			case <-timeout:
+				t.Fatal("Timeout waiting for reconnection")
+			}
+		}
+
+		// Verify connection count
+		if connectionCount != 2 {
+			t.Errorf("Expected 2 connections, got %d", connectionCount)
+		}
+
+		// Verify client is connected
+		if !client.isConnected() {
+			t.Error("Client should be connected after reconnect")
+		}
+
+		// Verify socket ID has changed (indicating a new connection)
+		if !strings.Contains(client.socketID, "socket-2") {
+			t.Errorf("Expected new socket ID after reconnect, got %s", client.socketID)
+		}
+	})
+
+	t.Run("exponentialBackoffOnReconnectFailure", func(t *testing.T) {
+		// Create a mock server that always refuses connections after initial setup
+		initialConnectionEstablished := false
+		failureCount := 0
+
+		server := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+			if !initialConnectionEstablished {
+				// Send connection established event for first connection
+				connData, _ := json.Marshal(connectionData{
+					SocketID:        "test-socket",
+					ActivityTimeout: 1,
+				})
+				connDataStr, _ := json.Marshal(string(connData))
+				websocket.JSON.Send(ws, Event{Event: pusherConnEstablished, Data: connDataStr})
+				initialConnectionEstablished = true
+
+				// Wait a moment before closing
+				time.Sleep(100 * time.Millisecond)
+				ws.Close()
+			} else {
+				// Count connection attempts but immediately close
+				failureCount++
+				ws.Close()
+			}
+		}))
+		defer server.Close()
+
+		// Create client with error channel
+		errorChan := make(chan error, 20)
+		host, port, _ := getServerHostPort(server)
+
+		client := &Client{
+			Insecure:     true,
+			OverrideHost: host,
+			OverridePort: port,
+			Errors:       errorChan,
+			// Start with very small delay for testing
+			ReconnectDelay: 50 * time.Millisecond,
+		}
+		defer client.Disconnect()
+
+		// Connect to server
+		err := client.Connect("test-app-key")
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+
+		// Collect errors to analyze reconnection attempts
+		var reconnectAttempts []time.Duration
+		var lastAttemptTime time.Time
+
+		// Wait for at least 4 reconnection attempts
+		timeout := time.After(10 * time.Second)
+		startTime := time.Now()
+
+	ErrorLoop:
+		for len(reconnectAttempts) < 4 {
+			select {
+			case err := <-errorChan:
+				// Look for reconnection attempt messages
+				attemptMatch := regexp.MustCompile(`attempting reconnection after ([0-9]+)(\.[0-9]+)?(ms|s)`)
+				matches := attemptMatch.FindStringSubmatch(err.Error())
+
+				if len(matches) > 0 {
+					if !lastAttemptTime.IsZero() {
+						timeSinceLast := time.Since(lastAttemptTime)
+						reconnectAttempts = append(reconnectAttempts, timeSinceLast)
+					}
+					lastAttemptTime = time.Now()
+				}
+			case <-timeout:
+				break ErrorLoop
+			}
+		}
+
+		// Verify we got at least a few reconnection attempts
+		if len(reconnectAttempts) < 3 {
+			t.Fatalf("Expected at least 3 reconnection intervals, got %d", len(reconnectAttempts))
+		}
+
+		// Verify exponential backoff (each delay should be ~2x the previous)
+		for i := 1; i < len(reconnectAttempts); i++ {
+			ratio := float64(reconnectAttempts[i]) / float64(reconnectAttempts[i-1])
+			// Allow some wiggle room in timing
+			if ratio < 1.5 || ratio > 2.5 {
+				t.Errorf("Expected exponential backoff with ratio ~2.0, got %f for attempts %d and %d", ratio, i-1, i)
+			}
+		}
+
+		// Verify delay doesn't exceed maximum
+		totalTestTime := time.Since(startTime)
+		if totalTestTime > 20*time.Second {
+			t.Errorf("Reconnect delays grew too large, test took %v", totalTestTime)
+		}
+	})
+
+	t.Run("reconnectsAndRestoresSubscriptions", func(t *testing.T) {
+		// Track subscription state across connections
+		subscriptionCounts := make(map[string]int)
+		var subscribedChannels []string
+		var connectionMutex sync.Mutex
+		connectionCount := 0
+
+		server := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+			connectionMutex.Lock()
+			connectionCount++
+			connID := connectionCount
+			connectionMutex.Unlock()
+
+			// Send connection established event
+			connData, _ := json.Marshal(connectionData{
+				SocketID:        fmt.Sprintf("socket-%d", connID),
+				ActivityTimeout: 1,
+			})
+			connDataStr, _ := json.Marshal(string(connData))
+			websocket.JSON.Send(ws, Event{Event: pusherConnEstablished, Data: connDataStr})
+
+			// Process messages until connection closes
+			for {
+				var evt Event
+				err := websocket.JSON.Receive(ws, &evt)
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					continue
+				}
+
+				// Handle subscription requests
+				if evt.Event == pusherSubscribe {
+					var data struct {
+						Channel string `json:"channel"`
+					}
+					json.Unmarshal(evt.Data, &data)
+
+					connectionMutex.Lock()
+					subscriptionCounts[data.Channel]++
+
+					// Track channels for the first connection
+					if connID == 1 && !contains(subscribedChannels, data.Channel) {
+						subscribedChannels = append(subscribedChannels, data.Channel)
+					}
+					connectionMutex.Unlock()
+
+					// Send subscription success
+					websocket.JSON.Send(ws, Event{
+						Event:   pusherInternalSubSucceeded,
+						Channel: data.Channel,
+					})
+				}
+			}
+		}))
+		defer server.Close()
+
+		// Create client
+		errorChan := make(chan error, 10)
+		host, port, _ := getServerHostPort(server)
+
+		client := &Client{
+			Insecure:       true,
+			OverrideHost:   host,
+			OverridePort:   port,
+			Errors:         errorChan,
+			ReconnectDelay: 100 * time.Millisecond,
+		}
+		defer client.Disconnect()
+
+		// Connect to server
+		err := client.Connect("test-app-key")
+		if err != nil {
+			t.Fatalf("Failed to connect: %v", err)
+		}
+
+		// Subscribe to multiple channels
+		channelNames := []string{"test-channel-1", "test-channel-2", "test-channel-3"}
+		for _, name := range channelNames {
+			_, err := client.Subscribe(name)
+			if err != nil {
+				t.Fatalf("Failed to subscribe to channel %s: %v", name, err)
+			}
+		}
+
+		// Wait a moment to ensure subscriptions are processed
+		time.Sleep(200 * time.Millisecond)
+
+		// Force a disconnection by closing the websocket
+		client.ws.Close()
+
+		// Wait for reconnection and resubscription
+		time.Sleep(2 * time.Second)
+
+		// Verify client reconnected
+		if !client.isConnected() {
+			t.Error("Client should be connected after reconnect")
+		}
+
+		// Verify number of connections
+		if connectionCount != 2 {
+			t.Errorf("Expected 2 connections, got %d", connectionCount)
+		}
+
+		// Verify each channel was subscribed to twice (once per connection)
+		for _, channel := range channelNames {
+			count, exists := subscriptionCounts[channel]
+			if !exists {
+				t.Errorf("Channel %s was never subscribed to", channel)
+			} else if count != 2 {
+				t.Errorf("Expected channel %s to be subscribed 2 times, got %d", channel, count)
+			}
+		}
+	})
+}
+
+// Helper functions
+func getServerHostPort(server *httptest.Server) (host string, port int, err error) {
+	host, portStr, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		return "", 0, err
+	}
+	port, err = strconv.Atoi(portStr)
+	return host, port, err
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }

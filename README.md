@@ -28,4 +28,4 @@ This package implements a Pusher websocket client. It is based on the official [
 * [x] Unbind events
 * [x] Presence channel member data
 * [ ] Cancel subscribing
-* [ ] Handle pong timeout/reconnect
+* [x] Handle pong timeout/reconnect

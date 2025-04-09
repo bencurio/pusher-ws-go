@@ -24,6 +24,9 @@ type Channel interface {
 	// does not mean that the unsubscription was successful, just that the request
 	// was sent.
 	Unsubscribe() error
+	// ResetSubscriptionState clears the internal subscription state without sending an unsubscribe event.
+	// This is used during reconnection to ensure that a fresh subscribe message will be sent.
+	ResetSubscriptionState()
 	// Bind returns a channel to which all the data from all matching events received
 	// on the channel will be sent.
 	Bind(event string) chan json.RawMessage
@@ -157,6 +160,13 @@ func (c *channel) Unsubscribe() error {
 	}, "")
 }
 
+func (c *channel) ResetSubscriptionState() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.subscribed = false
+}
+
 func (c *channel) Bind(event string) chan json.RawMessage {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
@@ -244,6 +254,10 @@ type AuthError struct {
 
 func (e AuthError) Error() string {
 	return fmt.Sprintf("Auth error: status code %d, response body: %q", e.Status, e.Body)
+}
+
+func (c *privateChannel) ResetSubscriptionState() {
+	c.channel.ResetSubscriptionState()
 }
 
 func (c *privateChannel) Subscribe(opts ...SubscribeOption) error {

@@ -39,6 +39,15 @@ const (
 	defaultHost       = "ws.pusherapp.com"
 	clusterHostFormat = "ws-%s.pusher.com"
 	protocolVersion   = "7"
+
+	// Default timeout for receiving a pong response after sending a ping
+	defaultPongTimeout = 30 * time.Second
+	// Number of failed pong responses before attempting to reconnect
+	maxPongFailures = 2
+	// Initial reconnect delay
+	initialReconnectDelay = 1 * time.Second
+	// Maximum reconnect delay with exponential backoff
+	maxReconnectDelay = 60 * time.Second
 )
 
 type boundEventChans map[chan Event]struct{}
@@ -70,13 +79,17 @@ type Client struct {
 	socketID string
 	// TODO: make this configurable
 	activityTimeout time.Duration
-	// TODO: implement timeout logic
-	// pongTimeout time.Duration
+	pongTimeout     time.Duration
 
 	ws                 *websocket.Conn
 	connected          bool
 	activityTimer      *time.Timer
 	activityTimerReset chan struct{}
+	pongTimer          *time.Timer
+	pongReceived       chan struct{}
+	pongFailures       int
+	ReconnectDelay     time.Duration
+	appKey             string // Store the app key for reconnection
 	boundEvents        map[string]boundEventChans
 	// TODO: implement global bindings
 	// globalBindings     boundEventChans
@@ -133,8 +146,18 @@ func (c *Client) Connect(appKey string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	c.appKey = appKey
+	c.pongTimeout = defaultPongTimeout
+	c.ReconnectDelay = initialReconnectDelay
+	c.pongFailures = 0
+
+	return c.connectInternal()
+}
+
+// connectInternal handles the actual connection logic
+func (c *Client) connectInternal() error {
 	var err error
-	c.ws, err = websocket.Dial(c.generateConnURL(appKey), "", localOrigin)
+	c.ws, err = websocket.Dial(c.generateConnURL(c.appKey), "", localOrigin)
 	if err != nil {
 		return err
 	}
@@ -160,15 +183,42 @@ func (c *Client) Connect(appKey string) error {
 		c.activityTimeout = time.Duration(connData.ActivityTimeout) * time.Second
 		c.activityTimer = time.NewTimer(c.activityTimeout)
 		c.activityTimerReset = make(chan struct{}, 1)
-		c.boundEvents = map[string]boundEventChans{}
-		c.subscribedChannels = subscribedChannels{}
+		c.pongTimer = time.NewTimer(c.pongTimeout)
+		if !c.pongTimer.Stop() {
+			select {
+			case <-c.pongTimer.C:
+			default:
+			}
+		}
+		c.pongReceived = make(chan struct{}, 1)
+
+		if c.boundEvents == nil {
+			c.boundEvents = map[string]boundEventChans{}
+		}
+		if c.subscribedChannels == nil {
+			c.subscribedChannels = subscribedChannels{}
+		}
+
+		// Resubscribe to previously subscribed channels after reconnection
+		previousChannels := make([]string, 0, len(c.subscribedChannels))
+		for channelName, ch := range c.subscribedChannels {
+			previousChannels = append(previousChannels, channelName)
+			ch.ResetSubscriptionState()
+		}
 
 		go c.heartbeat()
 		go c.listen()
 
+		// Resubscribe to all channels
+		for _, channelName := range previousChannels {
+			if ch, ok := c.subscribedChannels[channelName]; ok {
+				ch.Subscribe()
+			}
+		}
+
 		return nil
 	default:
-		return fmt.Errorf("Got unknown event type from Pusher: %s", event.Event)
+		return fmt.Errorf("got unknown event type from Pusher: %s", event.Event)
 	}
 }
 
@@ -194,23 +244,122 @@ func (c *Client) heartbeat() {
 		case <-c.done:
 			return
 		case <-c.activityTimerReset:
+			if c.activityTimer == nil {
+				return
+			}
 			if !c.activityTimer.Stop() {
 				<-c.activityTimer.C
 			}
 			c.activityTimer.Reset(c.activityTimeout)
 
 		case <-c.activityTimer.C:
+			// Send ping and start pong timeout timer
 			err := websocket.Message.Send(c.ws, pingPayload)
 			if err != nil {
-				// TODO: implement timeout/reconnect logic
-				c.Disconnect()
+				c.attemptReconnect()
+				return
 			}
-			c.activityTimer.Reset(c.activityTimeout) // Reset the timer after sending the ping
+
+			// Reset and start pong timer
+			if c.pongTimer == nil {
+				return
+			}
+			if !c.pongTimer.Stop() {
+				select {
+				case <-c.pongTimer.C:
+				default:
+				}
+			}
+			c.pongTimer.Reset(c.pongTimeout)
+
+			// Start goroutine to wait for pong response
+			go func() {
+				select {
+				case <-c.pongReceived:
+					// Pong was received, reset failure counter
+					c.mutex.Lock()
+					c.pongFailures = 0
+					c.ReconnectDelay = initialReconnectDelay
+					c.mutex.Unlock()
+				case <-c.pongTimer.C:
+					// Pong timeout occurred
+					c.mutex.Lock()
+					c.pongFailures++
+					c.mutex.Unlock()
+
+					c.sendError(fmt.Errorf("pong timeout occurred, failure count: %d", c.pongFailures))
+
+					if c.pongFailures >= maxPongFailures {
+						c.sendError(fmt.Errorf("max pong failures reached (%d), attempting reconnect", maxPongFailures))
+						c.attemptReconnect()
+						return
+					}
+				case <-c.done:
+					return
+				}
+			}()
+
+			c.activityTimer.Reset(c.activityTimeout)
 		}
 	}
 }
 
+func (c *Client) attemptReconnect() {
+	c.mutex.Lock()
+
+	// Don't attempt reconnection if we're already disconnected
+	if !c.connected {
+		c.mutex.Unlock()
+		return
+	}
+
+	// Close the current connection and mark as disconnected
+	if c.done != nil {
+		close(c.done)
+	}
+	c.connected = false
+	oldWs := c.ws
+	c.mutex.Unlock()
+
+	// Close old websocket outside of lock
+	oldWs.Close()
+
+	// Implement exponential backoff for reconnection attempts
+	for {
+		c.mutex.Lock()
+		delay := c.ReconnectDelay
+		c.ReconnectDelay = min(c.ReconnectDelay*2, maxReconnectDelay)
+		c.mutex.Unlock()
+
+		c.sendError(fmt.Errorf("attempting reconnection after %v", delay))
+		time.Sleep(delay)
+
+		c.mutex.Lock()
+		err := c.connectInternal()
+		if err == nil {
+			c.mutex.Unlock()
+			c.sendError(fmt.Errorf("reconnection successful"))
+			return
+		}
+		c.mutex.Unlock()
+
+		c.sendError(fmt.Errorf("reconnection failed: %w", err))
+	}
+}
+
+// Helper function to get the minimum of two durations
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (c *Client) sendError(err error) {
+	if c.Errors == nil {
+		return
+	}
+
 	select {
 	case c.Errors <- err:
 	default:
@@ -234,7 +383,7 @@ func (c *Client) listen() {
 				c.sendError(err)
 				// If EOF, the connection has been closed
 				if errors.Is(err, io.EOF) {
-					c.Disconnect()
+					c.attemptReconnect()
 					return
 				}
 				continue
@@ -246,7 +395,11 @@ func (c *Client) listen() {
 			case pusherPing:
 				websocket.Message.Send(c.ws, pongPayload)
 			case pusherPong:
-				// TODO: stop pong timeout timer
+				// Signal that pong was received
+				select {
+				case c.pongReceived <- struct{}{}:
+				default:
+				}
 			case pusherError:
 				c.sendError(extractEventError(event))
 			default:
@@ -394,7 +547,13 @@ func (c *Client) Disconnect() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	close(c.done)
+	if !c.connected {
+		return nil
+	}
+
+	if c.done != nil {
+		close(c.done)
+	}
 	c.connected = false
 
 	return c.ws.Close()
